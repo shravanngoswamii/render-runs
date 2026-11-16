@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       chunks:
-        description: Parallel chunks, 1 to 20
+        description: Chunks, 1 to 40, at most 20 at once
         required: true
         default: 1
         type: number
@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$REF" =~ ^job/[a-z0-9]{8,32}$ ]] || { echo "not a job branch"; exit 1; }
-          [[ "$CHUNKS" =~ ^[0-9]+$ ]] && (( CHUNKS >= 1 && CHUNKS <= 20 )) || { echo "chunks must be 1 to 20"; exit 1; }
+          [[ "$CHUNKS" =~ ^[0-9]+$ ]] && (( CHUNKS >= 1 && CHUNKS <= 40 )) || { echo "chunks must be 1 to 40"; exit 1; }
           if [[ "$KIND" == script ]] && (( CHUNKS != 1 )); then echo "a script job runs as one chunk"; exit 1; fi
           list=$(seq 0 $((CHUNKS - 1)) | paste -sd, -)
           echo "chunks=[$list]" >> "$GITHUB_OUTPUT"
@@ -59,6 +59,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
         chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
     steps:
