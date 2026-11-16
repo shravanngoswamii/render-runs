@@ -1,0 +1,185 @@
+name: render
+run-name: render ${{ inputs.ref }}
+
+# Started by hand only. A job branch holds one encrypted bundle. Each chunk decrypts it, runs it for its share of the
+# work, and uploads its results encrypted again. Logs print counts and times, never anything from the bundle.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Job branch
+        required: true
+        type: string
+      chunks:
+        description: Parallel chunks, 1 to 20
+        required: true
+        default: 1
+        type: number
+      kind:
+        description: Job kind
+        required: true
+        default: frames
+        type: choice
+        options:
+          - frames
+          - script
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+    steps:
+      - id: plan
+        env:
+          REF: ${{ inputs.ref }}
+          CHUNKS: ${{ inputs.chunks }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^job/[a-z0-9]{8,32}$ ]] || { echo "not a job branch"; exit 1; }
+          [[ "$CHUNKS" =~ ^[0-9]+$ ]] && (( CHUNKS >= 1 && CHUNKS <= 20 )) || { echo "chunks must be 1 to 20"; exit 1; }
+          if [[ "$KIND" == script ]] && (( CHUNKS != 1 )); then echo "a script job runs as one chunk"; exit 1; fi
+          list=$(seq 0 $((CHUNKS - 1)) | paste -sd, -)
+          echo "chunks=[$list]" >> "$GITHUB_OUTPUT"
+
+  chunk:
+    needs: plan
+    name: chunk ${{ matrix.chunk }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: job
+          persist-credentials: false
+
+      - name: Decrypt
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$RENDER_KEY" > "$RUNNER_TEMP/key"
+          mkdir -p "$RUNNER_TEMP/w" "$RUNNER_TEMP/out/files"
+          gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback --passphrase-file "$RUNNER_TEMP/key" \
+            --decrypt job/job.tar.gz.gpg | tar -xzf - -C "$RUNNER_TEMP/w"
+          rm -rf job "$RUNNER_TEMP/key"
+          echo "decrypted with gpg $(gpg --version | head -1 | awk '{print $3}')"
+
+      - name: Install
+        env:
+          npm_config_update_notifier: "false"
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/w/src"
+          if [[ -f "$src/package-lock.json" ]]; then
+            (cd "$src" && npm ci --no-audit --no-fund) >> "$RUNNER_TEMP/out/log.txt" 2>&1 || { echo "install failed"; exit 1; }
+          fi
+          if ! command -v Xvfb > /dev/null; then
+            { sudo apt-get update -q && sudo apt-get install -y -q xvfb; } >> "$RUNNER_TEMP/out/log.txt" 2>&1
+          fi
+          echo "installed"
+
+      - name: Run
+        timeout-minutes: 330
+        env:
+          CHUNK: ${{ matrix.chunk }}
+          CHUNKS: ${{ inputs.chunks }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          export W="$RUNNER_TEMP/w" OUT="$RUNNER_TEMP/out/files" DISPLAY=:99
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp > /dev/null 2>&1 &
+          count() { find "$OUT" -type f | wc -l; }
+          start=$(date +%s)
+          bash "$W/job.sh" >> "$RUNNER_TEMP/out/log.txt" 2>&1 &
+          pid=$!
+          ticks=0
+          while kill -0 "$pid" 2> /dev/null; do
+            sleep 10
+            ticks=$((ticks + 1))
+            if (( ticks % 12 == 0 )); then echo "$(( ($(date +%s) - start) / 60 )) min: $(count) files"; fi
+          done
+          rc=0
+          wait "$pid" || rc=$?
+          echo "done in $(( $(date +%s) - start )) s with status $rc: $(count) files"
+          exit "$rc"
+
+      - name: Pack
+        id: pack
+        if: always()
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          CHUNK: ${{ matrix.chunk }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$RENDER_KEY" > "$RUNNER_TEMP/key"
+          mkdir -p "$RUNNER_TEMP/out" pack
+          name=$(printf 'c%02d' "$CHUNK")
+          tar -cf - -C "$RUNNER_TEMP/out" . | gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback \
+            --passphrase-file "$RUNNER_TEMP/key" --symmetric --cipher-algo AES256 --compress-algo none \
+            -o "$RUNNER_TEMP/$name.gpg"
+          rm -f "$RUNNER_TEMP/key"
+          split -b 120M -d -a 1 "$RUNNER_TEMP/$name.gpg" "pack/$name.p"
+          parts=$(find pack -name "$name.p*" | wc -l)
+          (( parts <= 4 )) || { echo "too big for 4 parts: use more chunks"; exit 1; }
+          for p in pack/"$name".p?; do sha256sum "$p" | awk '{print $1}' > "$p.sha256"; done
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
+          echo "packed $(stat -c %s "$RUNNER_TEMP/$name.gpg") bytes in $parts part(s)"
+
+      - name: Upload part 0
+        if: always() && steps.pack.outputs.parts >= 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.pack.outputs.name }}-p0
+          path: pack/${{ steps.pack.outputs.name }}.p0*
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload part 1
+        if: always() && steps.pack.outputs.parts >= 2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.pack.outputs.name }}-p1
+          path: pack/${{ steps.pack.outputs.name }}.p1*
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload part 2
+        if: always() && steps.pack.outputs.parts >= 3
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.pack.outputs.name }}-p2
+          path: pack/${{ steps.pack.outputs.name }}.p2*
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload part 3
+        if: always() && steps.pack.outputs.parts >= 4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.pack.outputs.name }}-p3
+          path: pack/${{ steps.pack.outputs.name }}.p3*
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
